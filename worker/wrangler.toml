@@ -1,0 +1,14 @@
+name = "foodtracker-api"
+main = "src/index.js"
+compatibility_date = "2024-09-23"
+compatibility_flags = ["nodejs_compat"]
+
+# Non-secret config. Set this to your deployed site origin so the browser
+# is allowed to call the API (CORS). Override locally in .dev.vars if needed.
+[vars]
+ALLOWED_ORIGIN = "https://sushenmathur.github.io"
+
+# Secrets are NOT stored here — set them with `wrangler secret put`:
+#   wrangler secret put MONGODB_URI     # mongodb+srv://…  (with the ROTATED password)
+#   wrangler secret put JWT_SECRET      # a long random string, e.g. `openssl rand -hex 32`
+#   wrangler secret put REGISTER_TOKEN  # a random string; required to register the one user
