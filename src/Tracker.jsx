@@ -10,6 +10,8 @@ import {
   Settings as SettingsIcon,
   X,
   Scale,
+  Star,
+  Dumbbell,
 } from "lucide-react";
 import {
   estimateFromText,
@@ -29,6 +31,13 @@ const MEALS = [
 
 const DEFAULT_TARGETS = { cal: 2135, p: 173, c: 224, f: 61, waterL: 3.6 };
 
+// Selectable Claude models (all support vision + structured outputs).
+const MODEL_OPTIONS = [
+  { id: "claude-opus-4-8", label: "Opus" },
+  { id: "claude-sonnet-5", label: "Sonnet" },
+  { id: "claude-haiku-4-5", label: "Haiku" },
+];
+
 // Seeds the "Recently logged" list on first run (Sushen's staples).
 const SEED_RECENTS = [
   { name: "Berry protein smoothie mix (150g)", cal: 105, p: 12, c: 15, f: 1 },
@@ -40,15 +49,18 @@ const SEED_RECENTS = [
 
 const GLASS_ML = 450; // one tap = one glass
 const RECENTS_CAP = 24;
+const RECENTS_SHOWN = 10;
 
 const todayKey = (d = new Date()) => d.toISOString().slice(0, 10);
-const emptyDay = () => ({ weight: null, water_ml: 0, items: [] });
+const emptyDay = () => ({ weight: null, water_ml: 0, items: [], burned: 0 });
 
 // Show whole numbers without a trailing ".0"
 const fmt = (n) => {
   const v = Math.round((Number(n) || 0) * 10) / 10;
   return Number.isInteger(v) ? String(v) : v.toFixed(1);
 };
+
+const sameName = (a, b) => a.trim().toLowerCase() === b.trim().toLowerCase();
 
 // ---- Storage helpers (async window.storage, see storage.js) ----
 async function getJSON(key, fallback) {
@@ -74,20 +86,24 @@ export default function Tracker() {
   const [day, setDay] = useState(emptyDay());
   const [targets, setTargets] = useState(DEFAULT_TARGETS);
   const [recents, setRecents] = useState(SEED_RECENTS);
+  const [favourites, setFavourites] = useState([]);
   const [apiKey, setApiKey] = useState("");
   const [model, setModel] = useState(DEFAULT_MODEL);
   const [weightHistory, setWeightHistory] = useState({}); // date -> weight
 
   const [weightInput, setWeightInput] = useState("");
+  const [burnInput, setBurnInput] = useState("");
   const [addState, setAddState] = useState(null); // { meal, staged } | null
   const [settingsOpen, setSettingsOpen] = useState(false);
 
   // ---- Load everything ----
   useEffect(() => {
     (async () => {
-      setDay(await getJSON(`log:${today}`, emptyDay()));
+      const loaded = await getJSON(`log:${today}`, emptyDay());
+      setDay({ ...emptyDay(), ...loaded });
       setTargets(await getJSON("targets", DEFAULT_TARGETS));
       setRecents(await getJSON("recents", SEED_RECENTS));
+      setFavourites(await getJSON("favourites", []));
       setApiKey(await getJSON("apiKey", ""));
       setModel(await getJSON("model", DEFAULT_MODEL));
 
@@ -112,9 +128,26 @@ export default function Tracker() {
   const pushRecent = (item) => {
     const clean = { name: item.name, cal: item.cal, p: item.p, c: item.c, f: item.f };
     setRecents((prev) => {
-      const deduped = prev.filter((r) => r.name.toLowerCase() !== clean.name.toLowerCase());
+      const deduped = prev.filter((r) => !sameName(r.name, clean.name));
       const next = [clean, ...deduped].slice(0, RECENTS_CAP);
       setJSON("recents", next);
+      return next;
+    });
+  };
+
+  const addFavourite = (item) => {
+    const clean = { name: item.name, cal: item.cal, p: item.p, c: item.c, f: item.f };
+    setFavourites((prev) => {
+      if (prev.some((f) => sameName(f.name, clean.name))) return prev;
+      const next = [...prev, clean];
+      setJSON("favourites", next);
+      return next;
+    });
+  };
+  const removeFavourite = (name) => {
+    setFavourites((prev) => {
+      const next = prev.filter((f) => !sameName(f.name, name));
+      setJSON("favourites", next);
       return next;
     });
   };
@@ -149,6 +182,14 @@ export default function Tracker() {
     setWeightInput("");
   };
 
+  const addBurned = () => {
+    const v = parseFloat(burnInput);
+    if (!v) return;
+    persistDay({ ...day, burned: (day.burned || 0) + Math.round(v) });
+    setBurnInput("");
+  };
+  const resetBurned = () => persistDay({ ...day, burned: 0 });
+
   const saveSettings = (next) => {
     setTargets(next.targets);
     setApiKey(next.apiKey);
@@ -168,7 +209,16 @@ export default function Tracker() {
     [day.items]
   );
 
-  const calRemaining = targets.cal - totals.cal;
+  // Exercise calories add to the day's budget (Apple Health would feed this later).
+  const burned = day.burned || 0;
+  const calorieBudget = targets.cal + burned;
+  const calRemaining = calorieBudget - totals.cal;
+
+  // Traffic light on calories consumed vs budget:
+  //   <50% consumed → green, 50–80% → amber, >80% (incl. over budget) → red.
+  const consumedPct = calorieBudget > 0 ? totals.cal / calorieBudget : 0;
+  const calColor =
+    consumedPct < 0.5 ? COLORS.green : consumedPct <= 0.8 ? COLORS.gold : COLORS.danger;
 
   // Weight: latest logged value and change vs the previous entry.
   const weightRows = useMemo(
@@ -212,7 +262,7 @@ export default function Tracker() {
         <div style={styles.header}>
           <div>
             <div style={styles.eyebrow}>DAILY MACROS</div>
-            <div style={styles.h1}>Sushen Macro Tracking</div>
+            <div style={styles.h1}>Sushen's Macro Tracking</div>
           </div>
           <button className="tap" onClick={() => setSettingsOpen(true)} style={styles.iconCircle} aria-label="Settings">
             <SettingsIcon size={18} color={COLORS.text} />
@@ -223,20 +273,25 @@ export default function Tracker() {
         <div style={styles.card}>
           <div style={styles.cardLabel}>TODAY</div>
           <div style={styles.wheelRow}>
-            <MacroWheel totals={totals} targets={targets} />
+            <MacroWheel totals={totals} targets={targets} calorieTarget={calorieBudget} calColor={calColor} />
             <div style={styles.macroList}>
               <MacroRow color={COLORS.gold} label="Protein" val={totals.p} goal={targets.p} />
               <MacroRow color={COLORS.sage} label="Carbs" val={totals.c} goal={targets.c} />
               <MacroRow color={COLORS.clay} label="Fat" val={totals.f} goal={targets.f} />
-              <div style={{ marginTop: 8, fontSize: 12, color: COLORS.textMuted }}>
+              <div style={{ marginTop: 8, fontSize: 12, fontWeight: 600, color: calColor }}>
                 {calRemaining >= 0 ? (
                   <span>
                     <Flame size={12} style={{ verticalAlign: -2 }} /> {fmt(calRemaining)} cal left
                   </span>
                 ) : (
-                  <span style={{ color: COLORS.danger }}>{fmt(-calRemaining)} cal over</span>
+                  <span>{fmt(-calRemaining)} cal over</span>
                 )}
               </div>
+              {burned > 0 && (
+                <div style={{ marginTop: 3, fontSize: 11, color: COLORS.textMuted }}>
+                  {fmt(targets.cal)} target + {fmt(burned)} exercise
+                </div>
+              )}
             </div>
           </div>
         </div>
@@ -279,14 +334,14 @@ export default function Tracker() {
           );
         })}
 
-        {/* Recently logged */}
+        {/* Recently logged (10 most recent) */}
         <div style={styles.card}>
           <div style={styles.cardLabel}>RECENTLY LOGGED</div>
           {recents.length === 0 ? (
             <div style={styles.emptyState}>Foods you log will show here for quick re-adding.</div>
           ) : (
             <div style={styles.quickRow}>
-              {recents.map((r) => (
+              {recents.slice(0, RECENTS_SHOWN).map((r) => (
                 <button
                   key={r.name}
                   className="tap"
@@ -301,6 +356,30 @@ export default function Tracker() {
             </div>
           )}
         </div>
+
+        {/* Favourites */}
+        {favourites.length > 0 && (
+          <div style={styles.card}>
+            <div style={styles.cardLabel}>
+              <Star size={11} fill={COLORS.gold} color={COLORS.gold} style={{ verticalAlign: -1, marginRight: 4 }} />
+              FAVOURITES
+            </div>
+            <div style={styles.quickRow}>
+              {favourites.map((f) => (
+                <button
+                  key={f.name}
+                  className="tap"
+                  onClick={() => openAdd("snack", [f])}
+                  style={styles.quickChip}
+                  title={`${fmt(f.cal)} cal · P${fmt(f.p)} C${fmt(f.c)} F${fmt(f.f)}`}
+                >
+                  <Plus size={11} />
+                  {f.name}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
 
         {/* Weight (manual) */}
         <div style={styles.card}>
@@ -340,6 +419,43 @@ export default function Tracker() {
           </div>
         </div>
 
+        {/* Exercise / calories burned */}
+        <div style={styles.card}>
+          <div style={styles.rowBetween}>
+            <div style={styles.cardLabel}>EXERCISE</div>
+            <Dumbbell size={14} color={COLORS.textMuted} />
+          </div>
+          <div style={styles.weightRow}>
+            <div>
+              <div className="num" style={styles.bigNum}>
+                {fmt(burned)}
+                <span style={styles.unit}> cal burned</span>
+              </div>
+              <div style={styles.muted}>
+                {burned > 0 ? "Added to today's calorie budget" : "Log a workout to earn back calories"}
+              </div>
+            </div>
+            <div style={styles.weightInputRow}>
+              <input
+                type="number"
+                inputMode="numeric"
+                placeholder="kcal"
+                value={burnInput}
+                onChange={(e) => setBurnInput(e.target.value)}
+                style={{ ...styles.input, width: 84 }}
+              />
+              <button className="tap" onClick={addBurned} style={styles.smallBtn}>
+                Add
+              </button>
+            </div>
+          </div>
+          {burned > 0 && (
+            <button className="tap" onClick={resetBurned} style={styles.linkBtn}>
+              Reset
+            </button>
+          )}
+        </div>
+
         {/* Water */}
         <div style={styles.card}>
           <div style={styles.rowBetween}>
@@ -377,6 +493,9 @@ export default function Tracker() {
           apiKey={apiKey}
           model={model}
           recents={recents}
+          favourites={favourites}
+          onAddFavourite={addFavourite}
+          onRemoveFavourite={removeFavourite}
           onClose={() => setAddState(null)}
           onOpenSettings={() => {
             setAddState(null);
@@ -403,7 +522,7 @@ export default function Tracker() {
 }
 
 // ---- Macro wheel (three arcs = % of each macro goal met) ----
-function MacroWheel({ totals, targets }) {
+function MacroWheel({ totals, targets, calorieTarget, calColor }) {
   const R = 70;
   const CIRC = 2 * Math.PI * R;
   const arcLen = CIRC / 3 - 6;
@@ -421,11 +540,11 @@ function MacroWheel({ totals, targets }) {
         <circle cx="90" cy="90" r={R} fill="none" stroke={COLORS.clay} strokeWidth="14"
           strokeDasharray={`${fArc} ${CIRC}`} strokeDashoffset={-(2 * CIRC / 3)} strokeLinecap="round" />
       </g>
-      <text x="90" y="84" textAnchor="middle" className="num" fontSize="26" fontWeight="700" fill={COLORS.text}>
+      <text x="90" y="84" textAnchor="middle" className="num" fontSize="26" fontWeight="700" fill={calColor}>
         {fmt(totals.cal)}
       </text>
       <text x="90" y="104" textAnchor="middle" fontSize="11" fill={COLORS.textMuted}>
-        of {fmt(targets.cal)} cal
+        of {fmt(calorieTarget)} cal
       </text>
     </svg>
   );
@@ -447,7 +566,19 @@ function MacroRow({ color, label, val, goal }) {
 // ---- Add Food modal ----
 // Unified staging: AI / photo / manual all fill an editable list of items,
 // which the user reviews and then commits to the chosen meal.
-function AddFoodModal({ initialMeal, initialStaged, apiKey, model, recents, onClose, onOpenSettings, onCommit }) {
+function AddFoodModal({
+  initialMeal,
+  initialStaged,
+  apiKey,
+  model,
+  recents,
+  favourites,
+  onAddFavourite,
+  onRemoveFavourite,
+  onClose,
+  onOpenSettings,
+  onCommit,
+}) {
   const [meal, setMeal] = useState(initialMeal);
   const [method, setMethod] = useState(initialStaged.length ? "manual" : "ai");
   const [staged, setStaged] = useState(() =>
@@ -460,11 +591,18 @@ function AddFoodModal({ initialMeal, initialStaged, apiKey, model, recents, onCl
   const fileRef = useRef(null);
 
   const hasKey = !!apiKey;
+  const isFav = (name) => name && favourites.some((f) => sameName(f.name, name));
 
   const addStaged = (items) => setStaged((prev) => [...prev, ...items]);
   const updateStaged = (idx, patch) =>
     setStaged((prev) => prev.map((it, i) => (i === idx ? { ...it, ...patch } : it)));
   const removeStaged = (idx) => setStaged((prev) => prev.filter((_, i) => i !== idx));
+
+  const toggleFav = (item) => {
+    if (!item.name || !item.name.trim()) return;
+    if (isFav(item.name)) onRemoveFavourite(item.name);
+    else onAddFavourite(item);
+  };
 
   const runText = async () => {
     if (!text.trim()) return;
@@ -497,17 +635,15 @@ function AddFoodModal({ initialMeal, initialStaged, apiKey, model, recents, onCl
     }
   };
 
-  const validStaged = staged.filter((it) => it.name && it.name.trim() && Number(it.cal) >= 0 && (it.name.trim() || it.cal));
+  const validStaged = staged.filter((it) => it.name && it.name.trim());
   const commit = () => {
-    const items = staged
-      .filter((it) => it.name && it.name.trim())
-      .map((it) => ({
-        name: it.name.trim(),
-        cal: Number(it.cal) || 0,
-        p: Number(it.p) || 0,
-        c: Number(it.c) || 0,
-        f: Number(it.f) || 0,
-      }));
+    const items = validStaged.map((it) => ({
+      name: it.name.trim(),
+      cal: Number(it.cal) || 0,
+      p: Number(it.p) || 0,
+      c: Number(it.c) || 0,
+      f: Number(it.f) || 0,
+    }));
     if (items.length) onCommit(meal, items);
   };
 
@@ -614,17 +750,41 @@ function AddFoodModal({ initialMeal, initialStaged, apiKey, model, recents, onCl
         <div style={{ marginTop: 6 }}>
           <div style={styles.cardLabel}>ITEMS</div>
           {staged.map((it, idx) => (
-            <ItemEditor key={idx} item={it} onChange={(patch) => updateStaged(idx, patch)} onRemove={() => removeStaged(idx)} />
+            <ItemEditor
+              key={idx}
+              item={it}
+              favourited={isFav(it.name)}
+              onToggleFav={() => toggleFav(it)}
+              onChange={(patch) => updateStaged(idx, patch)}
+              onRemove={() => removeStaged(idx)}
+            />
           ))}
         </div>
       )}
 
-      {/* Recents inside modal for quick staging */}
+      {/* Favourites — pull frequent items into the log */}
+      {favourites.length > 0 && (
+        <div style={{ marginTop: 10 }}>
+          <div style={styles.cardLabel}>FAVOURITES</div>
+          <div style={styles.quickRow}>
+            {favourites.map((f) => (
+              <FavChip
+                key={f.name}
+                item={f}
+                onAdd={() => addStaged([{ name: f.name, cal: f.cal, p: f.p, c: f.c, f: f.f }])}
+                onRemove={() => onRemoveFavourite(f.name)}
+              />
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Recents (10 most recent) */}
       {recents.length > 0 && (
         <div style={{ marginTop: 10 }}>
           <div style={styles.cardLabel}>RECENT</div>
           <div style={styles.quickRow}>
-            {recents.slice(0, 12).map((r) => (
+            {recents.slice(0, RECENTS_SHOWN).map((r) => (
               <button
                 key={r.name}
                 className="tap"
@@ -653,7 +813,13 @@ function AddFoodModal({ initialMeal, initialStaged, apiKey, model, recents, onCl
   );
 }
 
-function ItemEditor({ item, onChange, onRemove }) {
+function ItemEditor({ item, favourited, onToggleFav, onChange, onRemove }) {
+  const macros = [
+    ["cal", "Cal"],
+    ["p", "Protein (g)"],
+    ["c", "Carbs (g)"],
+    ["f", "Fat (g)"],
+  ];
   return (
     <div style={styles.editorCard}>
       <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
@@ -663,29 +829,49 @@ function ItemEditor({ item, onChange, onRemove }) {
           onChange={(e) => onChange({ name: e.target.value })}
           style={{ ...styles.input, flex: 1 }}
         />
+        <button
+          className="tap"
+          onClick={onToggleFav}
+          style={styles.iconBtn}
+          aria-label={favourited ? "Remove from favourites" : "Add to favourites"}
+          title={favourited ? "Remove from favourites" : "Add to favourites"}
+        >
+          <Star size={16} color={favourited ? COLORS.gold : COLORS.textMuted} fill={favourited ? COLORS.gold : "none"} />
+        </button>
         <button className="tap" onClick={onRemove} style={styles.iconBtn} aria-label="Remove item">
           <X size={15} color={COLORS.textMuted} />
         </button>
       </div>
       <div style={styles.formGrid}>
-        {[
-          ["cal", "kcal"],
-          ["p", "protein"],
-          ["c", "carbs"],
-          ["f", "fat"],
-        ].map(([field, ph]) => (
-          <input
-            key={field}
-            type="number"
-            inputMode="decimal"
-            placeholder={ph}
-            value={item[field]}
-            onChange={(e) => onChange({ [field]: e.target.value })}
-            style={styles.input}
-          />
+        {macros.map(([field, label]) => (
+          <label key={field} style={styles.fieldLabel}>
+            <span style={styles.miniLabel}>{label}</span>
+            <input
+              type="number"
+              inputMode="decimal"
+              placeholder="0"
+              value={item[field]}
+              onChange={(e) => onChange({ [field]: e.target.value })}
+              style={styles.input}
+            />
+          </label>
         ))}
       </div>
     </div>
+  );
+}
+
+function FavChip({ item, onAdd, onRemove }) {
+  return (
+    <span style={styles.favChip} title={`${fmt(item.cal)} cal · P${fmt(item.p)} C${fmt(item.c)} F${fmt(item.f)}`}>
+      <button className="tap" onClick={onAdd} style={styles.favChipMain}>
+        <Plus size={11} />
+        {item.name}
+      </button>
+      <button className="tap" onClick={onRemove} style={styles.favChipX} aria-label="Remove favourite">
+        <X size={11} color={COLORS.textMuted} />
+      </button>
+    </span>
   );
 }
 
@@ -732,6 +918,23 @@ function SettingsModal({ targets, apiKey, model, onClose, onSave }) {
         </Labeled>
       </div>
 
+      <div style={{ ...styles.cardLabel, marginTop: 18 }}>AI MODEL</div>
+      <div style={styles.segmented}>
+        {MODEL_OPTIONS.map((m) => (
+          <button
+            key={m.id}
+            onClick={() => setMdl(m.id)}
+            style={{ ...styles.segment, ...(mdl === m.id ? styles.segmentActive : {}) }}
+          >
+            {m.label}
+          </button>
+        ))}
+      </div>
+      <div style={styles.hint}>
+        Opus is most capable, Haiku is fastest and cheapest, Sonnet is in between. Used for AI food
+        search and photo recognition.
+      </div>
+
       <div style={{ ...styles.cardLabel, marginTop: 18 }}>ANTHROPIC API KEY</div>
       <input
         type="password"
@@ -742,16 +945,9 @@ function SettingsModal({ targets, apiKey, model, onClose, onSave }) {
         autoComplete="off"
       />
       <div style={styles.hint}>
-        Used only from this browser for AI food search and photo recognition. Stored locally, never
-        uploaded anywhere but Anthropic. Get a key at console.anthropic.com.
+        Used only from this browser. Stored locally, never uploaded anywhere but Anthropic. Get a key
+        at console.anthropic.com.
       </div>
-
-      <details style={{ marginTop: 12 }}>
-        <summary style={{ ...styles.cardLabel, cursor: "pointer" }}>ADVANCED</summary>
-        <Labeled label="Model">
-          <input value={mdl} onChange={(e) => setMdl(e.target.value)} style={styles.input} />
-        </Labeled>
-      </details>
 
       <button
         className="tap"
@@ -765,7 +961,7 @@ function SettingsModal({ targets, apiKey, model, onClose, onSave }) {
               waterL: Number(t.waterL) || 0,
             },
             apiKey: key.trim(),
-            model: (mdl || DEFAULT_MODEL).trim(),
+            model: mdl || DEFAULT_MODEL,
           })
         }
         style={{ ...styles.primaryBtn, marginTop: 16 }}
@@ -808,6 +1004,7 @@ const COLORS = {
   text: "#F5EFE4",
   textMuted: "#A79C89",
   gold: "#E3A438",
+  green: "#6FB07F",
   sage: "#7C9473",
   clay: "#B97155",
   blue: "#5C8AA8",
@@ -859,10 +1056,26 @@ const styles = {
     border: `1px solid ${COLORS.border}`, borderRadius: 8, padding: "6px 10px",
     fontSize: 11.5, color: COLORS.text, whiteSpace: "nowrap", maxWidth: "100%",
   },
+  favChip: {
+    display: "inline-flex", alignItems: "stretch", background: COLORS.bg,
+    border: `1px solid ${COLORS.border}`, borderRadius: 8, overflow: "hidden", maxWidth: "100%",
+  },
+  favChipMain: {
+    display: "flex", alignItems: "center", gap: 4, background: "transparent", border: "none",
+    padding: "6px 8px 6px 10px", fontSize: 11.5, color: COLORS.text, whiteSpace: "nowrap",
+  },
+  favChipX: {
+    background: "transparent", border: "none", borderLeft: `1px solid ${COLORS.border}`,
+    padding: "0 7px", display: "flex", alignItems: "center",
+  },
   weightRow: { display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 },
   bigNum: { fontSize: 32, fontWeight: 700 },
   unit: { fontSize: 15, color: COLORS.textMuted, fontWeight: 500 },
   weightInputRow: { display: "flex", gap: 6 },
+  linkBtn: {
+    background: "transparent", border: "none", color: COLORS.textMuted, fontSize: 12,
+    padding: "8px 0 0", textDecoration: "underline",
+  },
   input: {
     background: COLORS.bg, border: `1px solid ${COLORS.border}`, borderRadius: 8,
     padding: "9px 10px", color: COLORS.text, fontSize: 13, width: "100%", outline: "none",
@@ -907,7 +1120,9 @@ const styles = {
   },
   tabActive: { color: "#1A1400", background: COLORS.gold, border: `1px solid ${COLORS.gold}` },
   form: { display: "flex", flexDirection: "column", gap: 8, marginBottom: 4 },
-  formGrid: { display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 6, marginTop: 6 },
+  formGrid: { display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 6, marginTop: 8 },
+  fieldLabel: { display: "flex", flexDirection: "column", gap: 3 },
+  miniLabel: { fontSize: 10, color: COLORS.textMuted, letterSpacing: 0.3 },
   primaryBtn: {
     background: COLORS.gold, color: "#1A1400", border: "none", borderRadius: 9,
     padding: "11px", fontWeight: 700, fontSize: 13, width: "100%",
