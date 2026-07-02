@@ -19,6 +19,8 @@ import {
   Library,
   ChevronDown,
   ChevronRight,
+  ChevronLeft,
+  CalendarDays,
   Pencil,
   ClipboardList,
   Check,
@@ -93,6 +95,7 @@ async function setJSON(key, value) {
 
 export default function Tracker() {
   const [today] = useState(() => todayKey());
+  const [viewDate, setViewDate] = useState(() => todayKey()); // day currently shown
   const [loading, setLoading] = useState(true);
 
   const [day, setDay] = useState(emptyDay());
@@ -114,11 +117,17 @@ export default function Tracker() {
   // Collapsible state for the Favourites / Recently logged cards.
   const [ui, setUi] = useState({ favesOpen: true, recentsOpen: true });
 
-  // ---- Load everything ----
+  // ---- Load the viewed day whenever the date changes ----
   useEffect(() => {
     (async () => {
-      const loaded = await getJSON(`log:${today}`, emptyDay());
+      const loaded = await getJSON(`log:${viewDate}`, emptyDay());
       setDay({ ...emptyDay(), ...loaded });
+    })();
+  }, [viewDate]);
+
+  // ---- Load everything else once ----
+  useEffect(() => {
+    (async () => {
       setTargets(await getJSON("targets", DEFAULT_TARGETS));
       setRecents(await getJSON("recents", SEED_RECENTS));
       setFavourites(await getJSON("favourites", []));
@@ -146,7 +155,7 @@ export default function Tracker() {
 
   const persistDay = (next) => {
     setDay(next);
-    setJSON(`log:${today}`, next);
+    setJSON(`log:${viewDate}`, next);
   };
 
   const toggleUi = (key) =>
@@ -226,7 +235,7 @@ export default function Tracker() {
     const w = parseFloat(weightInput);
     if (!w) return;
     persistDay({ ...day, weight: w });
-    setWeightHistory((h) => ({ ...h, [today]: w }));
+    setWeightHistory((h) => ({ ...h, [viewDate]: w }));
     setWeightInput("");
   };
 
@@ -304,6 +313,29 @@ export default function Tracker() {
 
   const openAdd = (meal = "snack", staged = []) => setAddState({ meal, staged });
 
+  // ---- Date navigation (review past days) ----
+  const shiftDate = (delta) => {
+    const [y, m, d] = viewDate.split("-").map(Number);
+    const key = new Date(Date.UTC(y, m - 1, d + delta)).toISOString().slice(0, 10);
+    if (key > today) return; // don't go past today
+    setViewDate(key);
+  };
+  const isToday = viewDate === today;
+  const yesterdayKey = (() => {
+    const [y, m, d] = today.split("-").map(Number);
+    return new Date(Date.UTC(y, m - 1, d - 1)).toISOString().slice(0, 10);
+  })();
+  const dateLabel = isToday
+    ? "Today"
+    : viewDate === yesterdayKey
+    ? "Yesterday"
+    : new Date(viewDate + "T00:00:00Z").toLocaleDateString(undefined, {
+        weekday: "short",
+        day: "numeric",
+        month: "short",
+        timeZone: "UTC",
+      });
+
   if (loading) {
     return (
       <div style={styles.page}>
@@ -336,9 +368,34 @@ export default function Tracker() {
           </button>
         </div>
 
+        {/* Date navigation */}
+        <div style={styles.dateBar}>
+          <button className="tap" onClick={() => shiftDate(-1)} style={styles.dateArrow} aria-label="Previous day">
+            <ChevronLeft size={18} color={COLORS.text} />
+          </button>
+          <div style={styles.dateCenter}>
+            <CalendarDays size={14} color={COLORS.textMuted} />
+            <span style={{ fontWeight: 600 }}>{dateLabel}</span>
+            {!isToday && (
+              <button className="tap" onClick={() => setViewDate(today)} style={styles.todayPill}>
+                Today
+              </button>
+            )}
+          </div>
+          <button
+            className="tap"
+            onClick={() => shiftDate(1)}
+            disabled={isToday}
+            style={{ ...styles.dateArrow, opacity: isToday ? 0.35 : 1 }}
+            aria-label="Next day"
+          >
+            <ChevronRight size={18} color={COLORS.text} />
+          </button>
+        </div>
+
         {/* Daily summary */}
         <div style={styles.card}>
-          <div style={styles.cardLabel}>TODAY</div>
+          <div style={styles.cardLabel}>{isToday ? "TODAY" : dateLabel.toUpperCase()}</div>
           <div style={styles.wheelRow}>
             <MacroWheel totals={totals} targets={targets} calorieTarget={calorieBudget} calColor={calColor} />
             <div style={styles.macroList}>
@@ -926,23 +983,37 @@ function AddFoodModal({
   );
 }
 
-// ---- Foods tab: log from library (weight-scaled) + manage the library ----
+// ---- Foods tab: log from library (by preset serving or grams) + manage it ----
+const EMPTY_FOOD_FORM = { name: "", serve: "", cal: "", p: "", c: "", f: "", servings: [] };
+
 function FoodsTab({ foods, onStage, onSaveFood, onDeleteFood }) {
-  const [grams, setGrams] = useState({}); // id -> grams string
-  const [editing, setEditing] = useState(null); // food id being edited, or "new", or null
-  const [form, setForm] = useState({ name: "", serve: "", cal: "", p: "", c: "", f: "" });
+  const [sel, setSel] = useState({}); // id -> "g" | servingId
+  const [qty, setQty] = useState({}); // id -> string (grams if "g", else count)
+  const [editing, setEditing] = useState(null); // food id | "new" | null
+  const [form, setForm] = useState(EMPTY_FOOD_FORM);
 
   const startNew = () => {
-    setForm({ name: "", serve: "", cal: "", p: "", c: "", f: "" });
+    setForm(EMPTY_FOOD_FORM);
     setEditing("new");
   };
   const startEdit = (food) => {
-    setForm({ name: food.name, serve: food.serve, cal: food.cal, p: food.p, c: food.c, f: food.f });
+    setForm({
+      name: food.name,
+      serve: food.serve,
+      cal: food.cal,
+      p: food.p,
+      c: food.c,
+      f: food.f,
+      servings: (food.servings || []).map((s) => ({ ...s })),
+    });
     setEditing(food.id);
   };
   const saveForm = () => {
     if (!form.name.trim() || !(Number(form.serve) > 0)) return;
-    const food = {
+    const servings = (form.servings || [])
+      .filter((s) => s.label.trim() && Number(s.grams) > 0)
+      .map((s) => ({ id: s.id || uid("s"), label: s.label.trim(), grams: Number(s.grams) }));
+    onSaveFood({
       id: editing === "new" ? uid("f") : editing,
       name: form.name.trim(),
       serve: Number(form.serve) || 0,
@@ -950,17 +1021,27 @@ function FoodsTab({ foods, onStage, onSaveFood, onDeleteFood }) {
       p: Number(form.p) || 0,
       c: Number(form.c) || 0,
       f: Number(form.f) || 0,
-    };
-    onSaveFood(food);
+      servings,
+    });
     setEditing(null);
   };
 
   const stageFood = (food) => {
-    const g = parseFloat(grams[food.id]);
-    const weight = g > 0 ? g : food.serve;
+    const key = sel[food.id] || "g";
+    const raw = parseFloat(qty[food.id]);
+    let weight, name;
+    if (key === "g") {
+      weight = raw > 0 ? raw : food.serve;
+      name = `${food.name} (${fmt(weight)}g)`;
+    } else {
+      const s = (food.servings || []).find((x) => x.id === key);
+      const count = raw > 0 ? raw : 1;
+      weight = (s ? s.grams : food.serve) * count;
+      name = `${food.name} — ${fmt(count)} × ${s ? s.label : "serving"}`;
+    }
     const factor = food.serve > 0 ? weight / food.serve : 1;
     onStage({
-      name: `${food.name} (${fmt(weight)}g)`,
+      name,
       cal: Math.round(food.cal * factor),
       p: round1(food.p * factor),
       c: round1(food.c * factor),
@@ -968,22 +1049,15 @@ function FoodsTab({ foods, onStage, onSaveFood, onDeleteFood }) {
     });
   };
 
-  const macroFields = [
-    ["cal", "Cal"],
-    ["p", "Protein (g)"],
-    ["c", "Carbs (g)"],
-    ["f", "Fat (g)"],
-  ];
-
   return (
     <div style={styles.form}>
       {foods.length === 0 && editing == null && (
-        <div style={styles.emptyState}>No custom foods yet. Add one to log it by weight.</div>
+        <div style={styles.emptyState}>No custom foods yet. Add one to log it by serving or weight.</div>
       )}
 
       {foods.map((food) =>
         editing === food.id ? (
-          <FoodForm key={food.id} form={form} setForm={setForm} onSave={saveForm} onCancel={() => setEditing(null)} macroFields={macroFields} />
+          <FoodForm key={food.id} form={form} setForm={setForm} onSave={saveForm} onCancel={() => setEditing(null)} />
         ) : (
           <div key={food.id} style={styles.foodRow}>
             <div style={styles.rowBetween}>
@@ -1003,15 +1077,27 @@ function FoodsTab({ foods, onStage, onSaveFood, onDeleteFood }) {
               </div>
             </div>
             <div style={{ display: "flex", gap: 6, marginTop: 8, alignItems: "center" }}>
+              <select
+                value={sel[food.id] || "g"}
+                onChange={(e) => setSel((s) => ({ ...s, [food.id]: e.target.value }))}
+                style={{ ...styles.input, flex: 1, minWidth: 0 }}
+              >
+                <option value="g">grams</option>
+                {(food.servings || []).map((s) => (
+                  <option key={s.id} value={s.id}>
+                    {s.label} ({fmt(s.grams)}g)
+                  </option>
+                ))}
+              </select>
               <input
                 type="number"
                 inputMode="decimal"
-                placeholder={`${fmt(food.serve)} g`}
-                value={grams[food.id] ?? ""}
-                onChange={(e) => setGrams((g) => ({ ...g, [food.id]: e.target.value }))}
-                style={{ ...styles.input, width: 90 }}
+                placeholder={(sel[food.id] || "g") === "g" ? `${fmt(food.serve)}` : "1"}
+                value={qty[food.id] ?? ""}
+                onChange={(e) => setQty((q) => ({ ...q, [food.id]: e.target.value }))}
+                style={{ ...styles.input, width: 62 }}
+                aria-label={(sel[food.id] || "g") === "g" ? "grams" : "servings"}
               />
-              <span style={{ fontSize: 12, color: COLORS.textMuted }}>g</span>
               <button className="tap" onClick={() => stageFood(food)} style={{ ...styles.smallBtn, padding: "9px 14px" }}>
                 Add
               </button>
@@ -1021,7 +1107,7 @@ function FoodsTab({ foods, onStage, onSaveFood, onDeleteFood }) {
       )}
 
       {editing === "new" ? (
-        <FoodForm form={form} setForm={setForm} onSave={saveForm} onCancel={() => setEditing(null)} macroFields={macroFields} />
+        <FoodForm form={form} setForm={setForm} onSave={saveForm} onCancel={() => setEditing(null)} />
       ) : (
         <button className="tap" onClick={startNew} style={styles.secondaryBtn}>
           <Plus size={14} /> New food
@@ -1031,7 +1117,24 @@ function FoodsTab({ foods, onStage, onSaveFood, onDeleteFood }) {
   );
 }
 
-function FoodForm({ form, setForm, onSave, onCancel, macroFields }) {
+const MACRO_FIELDS = [
+  ["cal", "Cal"],
+  ["p", "Protein (g)"],
+  ["c", "Carbs (g)"],
+  ["f", "Fat (g)"],
+];
+
+function FoodForm({ form, setForm, onSave, onCancel }) {
+  const servings = form.servings || [];
+  const addServing = () =>
+    setForm({ ...form, servings: [...servings, { id: uid("s"), label: "", grams: "" }] });
+  const updateServing = (idx, patch) =>
+    setForm({ ...form, servings: servings.map((s, i) => (i === idx ? { ...s, ...patch } : s)) });
+  const removeServing = (idx) =>
+    setForm({ ...form, servings: servings.filter((_, i) => i !== idx) });
+
+  const valid = form.name.trim() && Number(form.serve) > 0;
+
   return (
     <div style={styles.editorCard}>
       <input
@@ -1041,7 +1144,7 @@ function FoodForm({ form, setForm, onSave, onCancel, macroFields }) {
         style={{ ...styles.input, marginBottom: 8 }}
       />
       <label style={styles.fieldLabel}>
-        <span style={styles.miniLabel}>Serve size (g)</span>
+        <span style={styles.miniLabel}>Default serving (g)</span>
         <input
           type="number"
           inputMode="decimal"
@@ -1051,9 +1154,9 @@ function FoodForm({ form, setForm, onSave, onCancel, macroFields }) {
           style={styles.input}
         />
       </label>
-      <div style={{ ...styles.miniLabel, margin: "8px 0 4px" }}>Per that serve size:</div>
+      <div style={{ ...styles.miniLabel, margin: "8px 0 4px" }}>Macros per the default serving:</div>
       <div style={styles.formGrid}>
-        {macroFields.map(([field, label]) => (
+        {MACRO_FIELDS.map(([field, label]) => (
           <label key={field} style={styles.fieldLabel}>
             <span style={styles.miniLabel}>{label}</span>
             <input
@@ -1067,15 +1170,44 @@ function FoodForm({ form, setForm, onSave, onCancel, macroFields }) {
           </label>
         ))}
       </div>
-      <div style={{ display: "flex", gap: 6, marginTop: 10 }}>
+
+      {/* Serving sizes — named portions in grams */}
+      <div style={{ ...styles.miniLabel, margin: "12px 0 6px" }}>SERVING SIZES (OPTIONAL)</div>
+      {servings.map((s, idx) => (
+        <div key={s.id || idx} style={{ display: "flex", gap: 6, marginBottom: 6, alignItems: "center" }}>
+          <input
+            placeholder="e.g. 1 slice"
+            value={s.label}
+            onChange={(e) => updateServing(idx, { label: e.target.value })}
+            style={{ ...styles.input, flex: 1, minWidth: 0 }}
+          />
+          <input
+            type="number"
+            inputMode="decimal"
+            placeholder="g"
+            value={s.grams}
+            onChange={(e) => updateServing(idx, { grams: e.target.value })}
+            style={{ ...styles.input, width: 64 }}
+          />
+          <span style={{ fontSize: 12, color: COLORS.textMuted }}>g</span>
+          <button className="tap" onClick={() => removeServing(idx)} style={styles.iconBtn} aria-label="Remove serving size">
+            <X size={15} color={COLORS.textMuted} />
+          </button>
+        </div>
+      ))}
+      <button className="tap" onClick={addServing} style={{ ...styles.secondaryBtn, padding: "8px" }}>
+        <Plus size={14} /> Add serving size
+      </button>
+
+      <div style={{ display: "flex", gap: 6, marginTop: 12 }}>
         <button className="tap" onClick={onCancel} style={{ ...styles.secondaryBtn, flex: 1 }}>
           Cancel
         </button>
         <button
           className="tap"
           onClick={onSave}
-          disabled={!form.name.trim() || !(Number(form.serve) > 0)}
-          style={{ ...styles.primaryBtn, flex: 1, opacity: !form.name.trim() || !(Number(form.serve) > 0) ? 0.5 : 1 }}
+          disabled={!valid}
+          style={{ ...styles.primaryBtn, flex: 1, opacity: valid ? 1 : 0.5 }}
         >
           Save food
         </button>
@@ -1553,6 +1685,20 @@ const styles = {
     padding: 16, marginBottom: 12,
   },
   cardLabel: { fontSize: 11, letterSpacing: 1.2, color: COLORS.textMuted, fontWeight: 600, marginBottom: 10 },
+  dateBar: {
+    display: "flex", alignItems: "center", justifyContent: "space-between",
+    background: COLORS.card, border: `1px solid ${COLORS.border}`, borderRadius: 14,
+    padding: "6px 8px", marginBottom: 12,
+  },
+  dateArrow: {
+    width: 34, height: 34, borderRadius: 10, background: "transparent", border: "none",
+    display: "flex", alignItems: "center", justifyContent: "center",
+  },
+  dateCenter: { display: "flex", alignItems: "center", gap: 8, fontSize: 14 },
+  todayPill: {
+    background: COLORS.gold, color: "#1A1400", border: "none", borderRadius: 20,
+    padding: "3px 10px", fontSize: 11, fontWeight: 700, marginLeft: 4,
+  },
   collapseHeader: {
     display: "flex", justifyContent: "space-between", alignItems: "center", width: "100%",
     background: "transparent", border: "none", padding: 0,

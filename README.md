@@ -13,9 +13,14 @@ browser via `localStorage`.
   is re-runnable from Settings. Targets remain fully editable by hand.
 - **Meal logging** into Breakfast, Lunch, Dinner and Snack (each with an icon and
   its own calorie subtotal).
-- **Custom food library** — save foods with a serve size in grams and their
-  cal/protein/carbs/fat; when logging, enter the weight and the macros scale
-  automatically. Edit and delete foods from the Foods tab.
+- **Custom food library** — save foods with a default serving in grams and their
+  cal/protein/carbs/fat, plus optional named **serving sizes** (e.g. "1 slice" =
+  40 g). When logging, pick a serving size (× a quantity) or enter grams, and the
+  macros scale automatically. Edit and delete foods from the Foods tab.
+- **Review past days** — a date bar (◀ / ▶, with a "Today" shortcut) lets you
+  move between days and see or edit each day's log. Meal logs are stored per date
+  (`log:YYYY-MM-DD`); the food library, favourites and recents are shared across
+  all days.
 - **AI food search** — describe a food ("large flat white and a ham & cheese
   toastie") and Claude estimates calories, protein, carbs and fat.
 - **AI photo recognition** — snap or upload a photo of a meal and get instant
