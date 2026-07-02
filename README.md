@@ -8,8 +8,14 @@ browser via `localStorage`.
 
 ## Features
 
-- **Meal logging** into Breakfast, Lunch, Dinner and Snack, each with its own
-  calorie subtotal.
+- **Guided calorie setup** — a BMR interview (Mifflin-St Jeor + activity level +
+  goal/pace) estimates your daily calories and macros; runs on first launch and
+  is re-runnable from Settings. Targets remain fully editable by hand.
+- **Meal logging** into Breakfast, Lunch, Dinner and Snack (each with an icon and
+  its own calorie subtotal).
+- **Custom food library** — save foods with a serve size in grams and their
+  cal/protein/carbs/fat; when logging, enter the weight and the macros scale
+  automatically. Edit and delete foods from the Foods tab.
 - **AI food search** — describe a food ("large flat white and a ham & cheese
   toastie") and Claude estimates calories, protein, carbs and fat.
 - **AI photo recognition** — snap or upload a photo of a meal and get instant
