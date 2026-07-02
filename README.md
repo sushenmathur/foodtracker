@@ -8,8 +8,14 @@ browser via `localStorage`.
 
 ## Features
 
-- **Meal logging** into Breakfast, Lunch, Dinner and Snack, each with its own
-  calorie subtotal.
+- **Guided calorie setup** — a BMR interview (Mifflin-St Jeor + activity level +
+  goal/pace) estimates your daily calories and macros; runs on first launch and
+  is re-runnable from Settings. Targets remain fully editable by hand.
+- **Meal logging** into Breakfast, Lunch, Dinner and Snack (each with an icon and
+  its own calorie subtotal).
+- **Custom food library** — save foods with a serve size in grams and their
+  cal/protein/carbs/fat; when logging, enter the weight and the macros scale
+  automatically. Edit and delete foods from the Foods tab.
 - **AI food search** — describe a food ("large flat white and a ham & cheese
   toastie") and Claude estimates calories, protein, carbs and fat.
 - **AI photo recognition** — snap or upload a photo of a meal and get instant
@@ -38,18 +44,28 @@ change it under Settings → Advanced. You pay Anthropic per request (roughly a
 fraction of a cent per text lookup, a little more per photo). Manual entry works
 with no key.
 
-## Apple Health / weight sync
+## Apple Health / weight & exercise sync
 
-Weight is entered **manually** today. Live Apple Health (HealthKit) sync is not
-possible from a web app — HealthKit is only accessible to **native iOS apps**, and
-a page served over the web has no API to read or write it.
+Weight is entered **manually** today, and **exercise calories burned** are
+entered manually in the Exercise card — burned calories are added to that day's
+calorie budget (the standard "eat back exercise calories" model), and the
+traffic-light on calories remaining reflects the adjusted budget.
 
-To add real Health sync later, this app would need to be wrapped as a native
-iOS app — e.g. with **Capacitor** (`@capacitor-community/health` /
+Live Apple Health (HealthKit) sync is not possible from a web app — HealthKit is
+only accessible to **native iOS apps**, and a page served over the web has no API
+to read or write it.
+
+To add real Health sync later, this app would need to be wrapped as a native iOS
+app — e.g. with **Capacitor** (`@capacitor-community/health` /
 `@perfood/capacitor-healthkit`) or **React Native** (`react-native-health`) —
 which exposes HealthKit through a native plugin. The web build here could be
-reused as the UI inside that shell; the weight store (`day.weight`) is the
-integration point where synced values would be written.
+reused as the UI inside that shell. Two integration points are already in place:
+
+- **Weight** → written to `day.weight` (currently from the manual input; would be
+  read from HealthKit body-mass samples).
+- **Active energy / calories burned** → written to `day.burned` (currently from
+  the manual Exercise input; would be read from HealthKit active-energy samples)
+  and automatically offset against the daily calorie target.
 
 ## Run it
 

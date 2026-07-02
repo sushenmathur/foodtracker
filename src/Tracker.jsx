@@ -10,6 +10,18 @@ import {
   Settings as SettingsIcon,
   X,
   Scale,
+  Star,
+  Dumbbell,
+  Coffee,
+  Sandwich,
+  UtensilsCrossed,
+  Cookie,
+  Library,
+  ChevronDown,
+  ChevronRight,
+  Pencil,
+  ClipboardList,
+  Check,
 } from "lucide-react";
 import {
   estimateFromText,
@@ -18,16 +30,24 @@ import {
   friendlyError,
   DEFAULT_MODEL,
 } from "./ai.js";
+import { ACTIVITY, GOALS, PACE, computePlan, planSteps, planIsValid, EMPTY_PROFILE } from "./bmr.js";
 
 // ---- Meals & defaults ----
 const MEALS = [
-  { key: "breakfast", label: "Breakfast" },
-  { key: "lunch", label: "Lunch" },
-  { key: "dinner", label: "Dinner" },
-  { key: "snack", label: "Snack" },
+  { key: "breakfast", label: "Breakfast", Icon: Coffee },
+  { key: "lunch", label: "Lunch", Icon: Sandwich },
+  { key: "dinner", label: "Dinner", Icon: UtensilsCrossed },
+  { key: "snack", label: "Snack", Icon: Cookie },
 ];
 
 const DEFAULT_TARGETS = { cal: 2135, p: 173, c: 224, f: 61, waterL: 3.6 };
+
+// Selectable Claude models (all support vision + structured outputs).
+const MODEL_OPTIONS = [
+  { id: "claude-opus-4-8", label: "Opus" },
+  { id: "claude-sonnet-5", label: "Sonnet" },
+  { id: "claude-haiku-4-5", label: "Haiku" },
+];
 
 // Seeds the "Recently logged" list on first run (Sushen's staples).
 const SEED_RECENTS = [
@@ -40,15 +60,19 @@ const SEED_RECENTS = [
 
 const GLASS_ML = 450; // one tap = one glass
 const RECENTS_CAP = 24;
+const RECENTS_SHOWN = 10;
 
 const todayKey = (d = new Date()) => d.toISOString().slice(0, 10);
-const emptyDay = () => ({ weight: null, water_ml: 0, items: [] });
+const emptyDay = () => ({ weight: null, water_ml: 0, items: [], burned: 0 });
 
 // Show whole numbers without a trailing ".0"
 const fmt = (n) => {
   const v = Math.round((Number(n) || 0) * 10) / 10;
   return Number.isInteger(v) ? String(v) : v.toFixed(1);
 };
+const round1 = (n) => Math.round((Number(n) || 0) * 10) / 10;
+const sameName = (a, b) => a.trim().toLowerCase() === b.trim().toLowerCase();
+const uid = (p) => p + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
 
 // ---- Storage helpers (async window.storage, see storage.js) ----
 async function getJSON(key, fallback) {
@@ -74,22 +98,38 @@ export default function Tracker() {
   const [day, setDay] = useState(emptyDay());
   const [targets, setTargets] = useState(DEFAULT_TARGETS);
   const [recents, setRecents] = useState(SEED_RECENTS);
+  const [favourites, setFavourites] = useState([]);
+  const [foods, setFoods] = useState([]); // custom food library
+  const [profile, setProfile] = useState(EMPTY_PROFILE);
   const [apiKey, setApiKey] = useState("");
   const [model, setModel] = useState(DEFAULT_MODEL);
   const [weightHistory, setWeightHistory] = useState({}); // date -> weight
 
   const [weightInput, setWeightInput] = useState("");
+  const [burnInput, setBurnInput] = useState("");
   const [addState, setAddState] = useState(null); // { meal, staged } | null
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [onboardOpen, setOnboardOpen] = useState(false);
+
+  // Collapsible state for the Favourites / Recently logged cards.
+  const [ui, setUi] = useState({ favesOpen: true, recentsOpen: true });
 
   // ---- Load everything ----
   useEffect(() => {
     (async () => {
-      setDay(await getJSON(`log:${today}`, emptyDay()));
+      const loaded = await getJSON(`log:${today}`, emptyDay());
+      setDay({ ...emptyDay(), ...loaded });
       setTargets(await getJSON("targets", DEFAULT_TARGETS));
       setRecents(await getJSON("recents", SEED_RECENTS));
+      setFavourites(await getJSON("favourites", []));
+      setFoods(await getJSON("foods", []));
+      setProfile(await getJSON("profile", EMPTY_PROFILE));
       setApiKey(await getJSON("apiKey", ""));
       setModel(await getJSON("model", DEFAULT_MODEL));
+      setUi(await getJSON("ui", { favesOpen: true, recentsOpen: true }));
+
+      const onboarded = await getJSON("onboarded", false);
+      if (!onboarded) setOnboardOpen(true);
 
       try {
         const listRes = await window.storage.list("log:");
@@ -109,26 +149,67 @@ export default function Tracker() {
     setJSON(`log:${today}`, next);
   };
 
+  const toggleUi = (key) =>
+    setUi((prev) => {
+      const next = { ...prev, [key]: !prev[key] };
+      setJSON("ui", next);
+      return next;
+    });
+
   const pushRecent = (item) => {
     const clean = { name: item.name, cal: item.cal, p: item.p, c: item.c, f: item.f };
     setRecents((prev) => {
-      const deduped = prev.filter((r) => r.name.toLowerCase() !== clean.name.toLowerCase());
+      const deduped = prev.filter((r) => !sameName(r.name, clean.name));
       const next = [clean, ...deduped].slice(0, RECENTS_CAP);
       setJSON("recents", next);
       return next;
     });
   };
 
+  const addFavourite = (item) => {
+    const clean = { name: item.name, cal: item.cal, p: item.p, c: item.c, f: item.f };
+    setFavourites((prev) => {
+      if (prev.some((f) => sameName(f.name, clean.name))) return prev;
+      const next = [...prev, clean];
+      setJSON("favourites", next);
+      return next;
+    });
+  };
+  const removeFavourite = (name) => {
+    setFavourites((prev) => {
+      const next = prev.filter((f) => !sameName(f.name, name));
+      setJSON("favourites", next);
+      return next;
+    });
+  };
+
+  // Custom food library CRUD
+  const saveFood = (food) => {
+    setFoods((prev) => {
+      const exists = prev.some((f) => f.id === food.id);
+      const next = exists ? prev.map((f) => (f.id === food.id ? food : f)) : [...prev, food];
+      setJSON("foods", next);
+      return next;
+    });
+  };
+  const deleteFood = (id) => {
+    setFoods((prev) => {
+      const next = prev.filter((f) => f.id !== id);
+      setJSON("foods", next);
+      return next;
+    });
+  };
+
   const addItems = (meal, items) => {
     const stamped = items.map((it, i) => ({
-      id: Date.now().toString(36) + i.toString(36) + Math.random().toString(36).slice(2, 5),
+      id: uid("i"),
       name: it.name,
       cal: Number(it.cal) || 0,
       p: Number(it.p) || 0,
       c: Number(it.c) || 0,
       f: Number(it.f) || 0,
       meal,
-      ts: Date.now(),
+      ts: Date.now() + i,
     }));
     persistDay({ ...day, items: [...day.items, ...stamped] });
     items.forEach(pushRecent);
@@ -149,6 +230,14 @@ export default function Tracker() {
     setWeightInput("");
   };
 
+  const addBurned = () => {
+    const v = parseFloat(burnInput);
+    if (!v) return;
+    persistDay({ ...day, burned: (day.burned || 0) + Math.round(v) });
+    setBurnInput("");
+  };
+  const resetBurned = () => persistDay({ ...day, burned: 0 });
+
   const saveSettings = (next) => {
     setTargets(next.targets);
     setApiKey(next.apiKey);
@@ -157,6 +246,26 @@ export default function Tracker() {
     setJSON("apiKey", next.apiKey);
     setJSON("model", next.model);
     setSettingsOpen(false);
+  };
+
+  const applyPlan = (plan, answers) => {
+    const nextTargets = {
+      cal: plan.dailyCalories,
+      p: plan.proteinG,
+      c: plan.carbsG,
+      f: plan.fatG,
+      waterL: plan.waterL || targets.waterL,
+    };
+    setTargets(nextTargets);
+    setProfile(answers);
+    setJSON("targets", nextTargets);
+    setJSON("profile", answers);
+    setJSON("onboarded", true);
+    setOnboardOpen(false);
+  };
+  const dismissOnboarding = () => {
+    setJSON("onboarded", true);
+    setOnboardOpen(false);
   };
 
   const totals = useMemo(
@@ -168,9 +277,17 @@ export default function Tracker() {
     [day.items]
   );
 
-  const calRemaining = targets.cal - totals.cal;
+  // Exercise calories add to the day's budget (Apple Health would feed this later).
+  const burned = day.burned || 0;
+  const calorieBudget = targets.cal + burned;
+  const calRemaining = calorieBudget - totals.cal;
 
-  // Weight: latest logged value and change vs the previous entry.
+  // Traffic light on calories consumed vs budget:
+  //   <50% consumed → green, 50–80% → amber, >80% (incl. over budget) → red.
+  const consumedPct = calorieBudget > 0 ? totals.cal / calorieBudget : 0;
+  const calColor =
+    consumedPct < 0.5 ? COLORS.green : consumedPct <= 0.8 ? COLORS.gold : COLORS.danger;
+
   const weightRows = useMemo(
     () =>
       Object.entries(weightHistory)
@@ -212,7 +329,7 @@ export default function Tracker() {
         <div style={styles.header}>
           <div>
             <div style={styles.eyebrow}>DAILY MACROS</div>
-            <div style={styles.h1}>Sushen Macro Tracking</div>
+            <div style={styles.h1}>Sushen's Macro Tracking</div>
           </div>
           <button className="tap" onClick={() => setSettingsOpen(true)} style={styles.iconCircle} aria-label="Settings">
             <SettingsIcon size={18} color={COLORS.text} />
@@ -223,20 +340,25 @@ export default function Tracker() {
         <div style={styles.card}>
           <div style={styles.cardLabel}>TODAY</div>
           <div style={styles.wheelRow}>
-            <MacroWheel totals={totals} targets={targets} />
+            <MacroWheel totals={totals} targets={targets} calorieTarget={calorieBudget} calColor={calColor} />
             <div style={styles.macroList}>
               <MacroRow color={COLORS.gold} label="Protein" val={totals.p} goal={targets.p} />
               <MacroRow color={COLORS.sage} label="Carbs" val={totals.c} goal={targets.c} />
               <MacroRow color={COLORS.clay} label="Fat" val={totals.f} goal={targets.f} />
-              <div style={{ marginTop: 8, fontSize: 12, color: COLORS.textMuted }}>
+              <div style={{ marginTop: 8, fontSize: 12, fontWeight: 600, color: calColor }}>
                 {calRemaining >= 0 ? (
                   <span>
                     <Flame size={12} style={{ verticalAlign: -2 }} /> {fmt(calRemaining)} cal left
                   </span>
                 ) : (
-                  <span style={{ color: COLORS.danger }}>{fmt(-calRemaining)} cal over</span>
+                  <span>{fmt(-calRemaining)} cal over</span>
                 )}
               </div>
+              {burned > 0 && (
+                <div style={{ marginTop: 3, fontSize: 11, color: COLORS.textMuted }}>
+                  {fmt(targets.cal)} target + {fmt(burned)} exercise
+                </div>
+              )}
             </div>
           </div>
         </div>
@@ -245,10 +367,14 @@ export default function Tracker() {
         {MEALS.map((meal) => {
           const items = day.items.filter((i) => i.meal === meal.key);
           const sub = items.reduce((a, it) => a + it.cal, 0);
+          const Icon = meal.Icon;
           return (
             <div key={meal.key} style={styles.card}>
               <div style={styles.rowBetween}>
                 <div style={styles.mealTitle}>
+                  <span style={styles.mealIcon}>
+                    <Icon size={16} color={COLORS.gold} />
+                  </span>
                   {meal.label}
                   <span className="num" style={styles.mealCal}>
                     {sub > 0 ? `${fmt(sub)} cal` : ""}
@@ -279,14 +405,42 @@ export default function Tracker() {
           );
         })}
 
-        {/* Recently logged */}
-        <div style={styles.card}>
-          <div style={styles.cardLabel}>RECENTLY LOGGED</div>
+        {/* Favourites (collapsible) */}
+        {favourites.length > 0 && (
+          <CollapsibleCard
+            open={ui.favesOpen}
+            onToggle={() => toggleUi("favesOpen")}
+            label={
+              <>
+                <Star size={11} fill={COLORS.gold} color={COLORS.gold} style={{ verticalAlign: -1, marginRight: 5 }} />
+                FAVOURITES
+              </>
+            }
+          >
+            <div style={styles.quickRow}>
+              {favourites.map((f) => (
+                <button
+                  key={f.name}
+                  className="tap"
+                  onClick={() => openAdd("snack", [f])}
+                  style={styles.quickChip}
+                  title={`${fmt(f.cal)} cal · P${fmt(f.p)} C${fmt(f.c)} F${fmt(f.f)}`}
+                >
+                  <Plus size={11} />
+                  {f.name}
+                </button>
+              ))}
+            </div>
+          </CollapsibleCard>
+        )}
+
+        {/* Recently logged (collapsible, 10 most recent) */}
+        <CollapsibleCard open={ui.recentsOpen} onToggle={() => toggleUi("recentsOpen")} label="RECENTLY LOGGED">
           {recents.length === 0 ? (
             <div style={styles.emptyState}>Foods you log will show here for quick re-adding.</div>
           ) : (
             <div style={styles.quickRow}>
-              {recents.map((r) => (
+              {recents.slice(0, RECENTS_SHOWN).map((r) => (
                 <button
                   key={r.name}
                   className="tap"
@@ -300,7 +454,7 @@ export default function Tracker() {
               ))}
             </div>
           )}
-        </div>
+        </CollapsibleCard>
 
         {/* Weight (manual) */}
         <div style={styles.card}>
@@ -340,6 +494,43 @@ export default function Tracker() {
           </div>
         </div>
 
+        {/* Exercise / calories burned */}
+        <div style={styles.card}>
+          <div style={styles.rowBetween}>
+            <div style={styles.cardLabel}>EXERCISE</div>
+            <Dumbbell size={14} color={COLORS.textMuted} />
+          </div>
+          <div style={styles.weightRow}>
+            <div>
+              <div className="num" style={styles.bigNum}>
+                {fmt(burned)}
+                <span style={styles.unit}> cal burned</span>
+              </div>
+              <div style={styles.muted}>
+                {burned > 0 ? "Added to today's calorie budget" : "Log a workout to earn back calories"}
+              </div>
+            </div>
+            <div style={styles.weightInputRow}>
+              <input
+                type="number"
+                inputMode="numeric"
+                placeholder="kcal"
+                value={burnInput}
+                onChange={(e) => setBurnInput(e.target.value)}
+                style={{ ...styles.input, width: 84 }}
+              />
+              <button className="tap" onClick={addBurned} style={styles.smallBtn}>
+                Add
+              </button>
+            </div>
+          </div>
+          {burned > 0 && (
+            <button className="tap" onClick={resetBurned} style={styles.linkBtn}>
+              Reset
+            </button>
+          )}
+        </div>
+
         {/* Water */}
         <div style={styles.card}>
           <div style={styles.rowBetween}>
@@ -367,7 +558,7 @@ export default function Tracker() {
           </div>
         </div>
 
-        <div style={styles.footer}>Tap a meal's Add to log by AI search, photo, or by hand.</div>
+        <div style={styles.footer}>Tap a meal's Add to log by AI search, photo, your food list, or by hand.</div>
       </div>
 
       {addState && (
@@ -377,6 +568,12 @@ export default function Tracker() {
           apiKey={apiKey}
           model={model}
           recents={recents}
+          favourites={favourites}
+          foods={foods}
+          onSaveFood={saveFood}
+          onDeleteFood={deleteFood}
+          onAddFavourite={addFavourite}
+          onRemoveFavourite={removeFavourite}
           onClose={() => setAddState(null)}
           onOpenSettings={() => {
             setAddState(null);
@@ -396,14 +593,42 @@ export default function Tracker() {
           model={model}
           onClose={() => setSettingsOpen(false)}
           onSave={saveSettings}
+          onLaunchSetup={() => {
+            setSettingsOpen(false);
+            setOnboardOpen(true);
+          }}
+        />
+      )}
+
+      {onboardOpen && (
+        <OnboardingModal
+          initialProfile={profile}
+          onApply={applyPlan}
+          onClose={dismissOnboarding}
         />
       )}
     </div>
   );
 }
 
+function CollapsibleCard({ label, open, onToggle, children }) {
+  return (
+    <div style={styles.card}>
+      <button className="tap" onClick={onToggle} style={styles.collapseHeader}>
+        <span style={styles.cardLabel}>{label}</span>
+        {open ? (
+          <ChevronDown size={16} color={COLORS.textMuted} />
+        ) : (
+          <ChevronRight size={16} color={COLORS.textMuted} />
+        )}
+      </button>
+      {open && <div style={{ marginTop: 10 }}>{children}</div>}
+    </div>
+  );
+}
+
 // ---- Macro wheel (three arcs = % of each macro goal met) ----
-function MacroWheel({ totals, targets }) {
+function MacroWheel({ totals, targets, calorieTarget, calColor }) {
   const R = 70;
   const CIRC = 2 * Math.PI * R;
   const arcLen = CIRC / 3 - 6;
@@ -421,11 +646,11 @@ function MacroWheel({ totals, targets }) {
         <circle cx="90" cy="90" r={R} fill="none" stroke={COLORS.clay} strokeWidth="14"
           strokeDasharray={`${fArc} ${CIRC}`} strokeDashoffset={-(2 * CIRC / 3)} strokeLinecap="round" />
       </g>
-      <text x="90" y="84" textAnchor="middle" className="num" fontSize="26" fontWeight="700" fill={COLORS.text}>
+      <text x="90" y="84" textAnchor="middle" className="num" fontSize="26" fontWeight="700" fill={calColor}>
         {fmt(totals.cal)}
       </text>
       <text x="90" y="104" textAnchor="middle" fontSize="11" fill={COLORS.textMuted}>
-        of {fmt(targets.cal)} cal
+        of {fmt(calorieTarget)} cal
       </text>
     </svg>
   );
@@ -445,9 +670,22 @@ function MacroRow({ color, label, val, goal }) {
 }
 
 // ---- Add Food modal ----
-// Unified staging: AI / photo / manual all fill an editable list of items,
-// which the user reviews and then commits to the chosen meal.
-function AddFoodModal({ initialMeal, initialStaged, apiKey, model, recents, onClose, onOpenSettings, onCommit }) {
+function AddFoodModal({
+  initialMeal,
+  initialStaged,
+  apiKey,
+  model,
+  recents,
+  favourites,
+  foods,
+  onSaveFood,
+  onDeleteFood,
+  onAddFavourite,
+  onRemoveFavourite,
+  onClose,
+  onOpenSettings,
+  onCommit,
+}) {
   const [meal, setMeal] = useState(initialMeal);
   const [method, setMethod] = useState(initialStaged.length ? "manual" : "ai");
   const [staged, setStaged] = useState(() =>
@@ -460,11 +698,18 @@ function AddFoodModal({ initialMeal, initialStaged, apiKey, model, recents, onCl
   const fileRef = useRef(null);
 
   const hasKey = !!apiKey;
+  const isFav = (name) => name && favourites.some((f) => sameName(f.name, name));
 
   const addStaged = (items) => setStaged((prev) => [...prev, ...items]);
   const updateStaged = (idx, patch) =>
     setStaged((prev) => prev.map((it, i) => (i === idx ? { ...it, ...patch } : it)));
   const removeStaged = (idx) => setStaged((prev) => prev.filter((_, i) => i !== idx));
+
+  const toggleFav = (item) => {
+    if (!item.name || !item.name.trim()) return;
+    if (isFav(item.name)) onRemoveFavourite(item.name);
+    else onAddFavourite(item);
+  };
 
   const runText = async () => {
     if (!text.trim()) return;
@@ -497,24 +742,23 @@ function AddFoodModal({ initialMeal, initialStaged, apiKey, model, recents, onCl
     }
   };
 
-  const validStaged = staged.filter((it) => it.name && it.name.trim() && Number(it.cal) >= 0 && (it.name.trim() || it.cal));
+  const validStaged = staged.filter((it) => it.name && it.name.trim());
   const commit = () => {
-    const items = staged
-      .filter((it) => it.name && it.name.trim())
-      .map((it) => ({
-        name: it.name.trim(),
-        cal: Number(it.cal) || 0,
-        p: Number(it.p) || 0,
-        c: Number(it.c) || 0,
-        f: Number(it.f) || 0,
-      }));
+    const items = validStaged.map((it) => ({
+      name: it.name.trim(),
+      cal: Number(it.cal) || 0,
+      p: Number(it.p) || 0,
+      c: Number(it.c) || 0,
+      f: Number(it.f) || 0,
+    }));
     if (items.length) onCommit(meal, items);
   };
 
   const methods = [
-    { key: "ai", label: "AI search", icon: Sparkles },
+    { key: "ai", label: "AI", icon: Sparkles },
     { key: "photo", label: "Photo", icon: Camera },
     { key: "manual", label: "Manual", icon: PencilLine },
+    { key: "foods", label: "Foods", icon: Library },
   ];
 
   return (
@@ -607,6 +851,10 @@ function AddFoodModal({ initialMeal, initialStaged, apiKey, model, recents, onCl
         </div>
       )}
 
+      {method === "foods" && (
+        <FoodsTab foods={foods} onStage={(item) => addStaged([item])} onSaveFood={onSaveFood} onDeleteFood={onDeleteFood} />
+      )}
+
       {error && <div style={styles.error}>{error}</div>}
 
       {/* Staged items (editable) */}
@@ -614,17 +862,53 @@ function AddFoodModal({ initialMeal, initialStaged, apiKey, model, recents, onCl
         <div style={{ marginTop: 6 }}>
           <div style={styles.cardLabel}>ITEMS</div>
           {staged.map((it, idx) => (
-            <ItemEditor key={idx} item={it} onChange={(patch) => updateStaged(idx, patch)} onRemove={() => removeStaged(idx)} />
+            <ItemEditor
+              key={idx}
+              item={it}
+              favourited={isFav(it.name)}
+              onToggleFav={() => toggleFav(it)}
+              onChange={(patch) => updateStaged(idx, patch)}
+              onRemove={() => removeStaged(idx)}
+            />
           ))}
         </div>
       )}
 
-      {/* Recents inside modal for quick staging */}
+      {/* Commit — kept directly under the items, above the pickers */}
+      <button
+        className="tap"
+        onClick={commit}
+        disabled={validStaged.length === 0}
+        style={{ ...styles.primaryBtn, marginTop: 12, opacity: validStaged.length === 0 ? 0.5 : 1 }}
+      >
+        {validStaged.length > 0
+          ? `Add ${validStaged.length} to ${MEALS.find((m) => m.key === meal).label}`
+          : "Add items to log"}
+      </button>
+
+      {/* Favourites — pull frequent items into the log */}
+      {favourites.length > 0 && (
+        <div style={{ marginTop: 14 }}>
+          <div style={styles.cardLabel}>FAVOURITES</div>
+          <div style={styles.quickRow}>
+            {favourites.map((f) => (
+              <FavChip
+                key={f.name}
+                item={f}
+                onAdd={() => addStaged([{ name: f.name, cal: f.cal, p: f.p, c: f.c, f: f.f }])}
+                onRemove={() => onRemoveFavourite(f.name)}
+              />
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Recents (10 most recent) */}
       {recents.length > 0 && (
-        <div style={{ marginTop: 10 }}>
+        <div style={{ marginTop: 12 }}>
           <div style={styles.cardLabel}>RECENT</div>
           <div style={styles.quickRow}>
-            {recents.slice(0, 12).map((r) => (
+            {recents.slice(0, RECENTS_SHOWN).map((r) => (
               <button
                 key={r.name}
                 className="tap"
@@ -638,22 +922,175 @@ function AddFoodModal({ initialMeal, initialStaged, apiKey, model, recents, onCl
           </div>
         </div>
       )}
-
-      <button
-        className="tap"
-        onClick={commit}
-        disabled={validStaged.length === 0}
-        style={{ ...styles.primaryBtn, marginTop: 14, opacity: validStaged.length === 0 ? 0.5 : 1 }}
-      >
-        {validStaged.length > 0
-          ? `Add ${validStaged.length} to ${MEALS.find((m) => m.key === meal).label}`
-          : "Add items to log"}
-      </button>
     </Overlay>
   );
 }
 
-function ItemEditor({ item, onChange, onRemove }) {
+// ---- Foods tab: log from library (weight-scaled) + manage the library ----
+function FoodsTab({ foods, onStage, onSaveFood, onDeleteFood }) {
+  const [grams, setGrams] = useState({}); // id -> grams string
+  const [editing, setEditing] = useState(null); // food id being edited, or "new", or null
+  const [form, setForm] = useState({ name: "", serve: "", cal: "", p: "", c: "", f: "" });
+
+  const startNew = () => {
+    setForm({ name: "", serve: "", cal: "", p: "", c: "", f: "" });
+    setEditing("new");
+  };
+  const startEdit = (food) => {
+    setForm({ name: food.name, serve: food.serve, cal: food.cal, p: food.p, c: food.c, f: food.f });
+    setEditing(food.id);
+  };
+  const saveForm = () => {
+    if (!form.name.trim() || !(Number(form.serve) > 0)) return;
+    const food = {
+      id: editing === "new" ? uid("f") : editing,
+      name: form.name.trim(),
+      serve: Number(form.serve) || 0,
+      cal: Number(form.cal) || 0,
+      p: Number(form.p) || 0,
+      c: Number(form.c) || 0,
+      f: Number(form.f) || 0,
+    };
+    onSaveFood(food);
+    setEditing(null);
+  };
+
+  const stageFood = (food) => {
+    const g = parseFloat(grams[food.id]);
+    const weight = g > 0 ? g : food.serve;
+    const factor = food.serve > 0 ? weight / food.serve : 1;
+    onStage({
+      name: `${food.name} (${fmt(weight)}g)`,
+      cal: Math.round(food.cal * factor),
+      p: round1(food.p * factor),
+      c: round1(food.c * factor),
+      f: round1(food.f * factor),
+    });
+  };
+
+  const macroFields = [
+    ["cal", "Cal"],
+    ["p", "Protein (g)"],
+    ["c", "Carbs (g)"],
+    ["f", "Fat (g)"],
+  ];
+
+  return (
+    <div style={styles.form}>
+      {foods.length === 0 && editing == null && (
+        <div style={styles.emptyState}>No custom foods yet. Add one to log it by weight.</div>
+      )}
+
+      {foods.map((food) =>
+        editing === food.id ? (
+          <FoodForm key={food.id} form={form} setForm={setForm} onSave={saveForm} onCancel={() => setEditing(null)} macroFields={macroFields} />
+        ) : (
+          <div key={food.id} style={styles.foodRow}>
+            <div style={styles.rowBetween}>
+              <div style={{ minWidth: 0 }}>
+                <div style={styles.itemName}>{food.name}</div>
+                <div style={styles.muted}>
+                  per {fmt(food.serve)}g · {fmt(food.cal)} cal · P{fmt(food.p)} C{fmt(food.c)} F{fmt(food.f)}
+                </div>
+              </div>
+              <div style={{ display: "flex", gap: 2, flexShrink: 0 }}>
+                <button className="tap" onClick={() => startEdit(food)} style={styles.iconBtn} aria-label="Edit food">
+                  <Pencil size={14} color={COLORS.textMuted} />
+                </button>
+                <button className="tap" onClick={() => onDeleteFood(food.id)} style={styles.iconBtn} aria-label="Delete food">
+                  <Trash2 size={14} color={COLORS.textMuted} />
+                </button>
+              </div>
+            </div>
+            <div style={{ display: "flex", gap: 6, marginTop: 8, alignItems: "center" }}>
+              <input
+                type="number"
+                inputMode="decimal"
+                placeholder={`${fmt(food.serve)} g`}
+                value={grams[food.id] ?? ""}
+                onChange={(e) => setGrams((g) => ({ ...g, [food.id]: e.target.value }))}
+                style={{ ...styles.input, width: 90 }}
+              />
+              <span style={{ fontSize: 12, color: COLORS.textMuted }}>g</span>
+              <button className="tap" onClick={() => stageFood(food)} style={{ ...styles.smallBtn, padding: "9px 14px" }}>
+                Add
+              </button>
+            </div>
+          </div>
+        )
+      )}
+
+      {editing === "new" ? (
+        <FoodForm form={form} setForm={setForm} onSave={saveForm} onCancel={() => setEditing(null)} macroFields={macroFields} />
+      ) : (
+        <button className="tap" onClick={startNew} style={styles.secondaryBtn}>
+          <Plus size={14} /> New food
+        </button>
+      )}
+    </div>
+  );
+}
+
+function FoodForm({ form, setForm, onSave, onCancel, macroFields }) {
+  return (
+    <div style={styles.editorCard}>
+      <input
+        placeholder="Food name"
+        value={form.name}
+        onChange={(e) => setForm({ ...form, name: e.target.value })}
+        style={{ ...styles.input, marginBottom: 8 }}
+      />
+      <label style={styles.fieldLabel}>
+        <span style={styles.miniLabel}>Serve size (g)</span>
+        <input
+          type="number"
+          inputMode="decimal"
+          placeholder="100"
+          value={form.serve}
+          onChange={(e) => setForm({ ...form, serve: e.target.value })}
+          style={styles.input}
+        />
+      </label>
+      <div style={{ ...styles.miniLabel, margin: "8px 0 4px" }}>Per that serve size:</div>
+      <div style={styles.formGrid}>
+        {macroFields.map(([field, label]) => (
+          <label key={field} style={styles.fieldLabel}>
+            <span style={styles.miniLabel}>{label}</span>
+            <input
+              type="number"
+              inputMode="decimal"
+              placeholder="0"
+              value={form[field]}
+              onChange={(e) => setForm({ ...form, [field]: e.target.value })}
+              style={styles.input}
+            />
+          </label>
+        ))}
+      </div>
+      <div style={{ display: "flex", gap: 6, marginTop: 10 }}>
+        <button className="tap" onClick={onCancel} style={{ ...styles.secondaryBtn, flex: 1 }}>
+          Cancel
+        </button>
+        <button
+          className="tap"
+          onClick={onSave}
+          disabled={!form.name.trim() || !(Number(form.serve) > 0)}
+          style={{ ...styles.primaryBtn, flex: 1, opacity: !form.name.trim() || !(Number(form.serve) > 0) ? 0.5 : 1 }}
+        >
+          Save food
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function ItemEditor({ item, favourited, onToggleFav, onChange, onRemove }) {
+  const macros = [
+    ["cal", "Cal"],
+    ["p", "Protein (g)"],
+    ["c", "Carbs (g)"],
+    ["f", "Fat (g)"],
+  ];
   return (
     <div style={styles.editorCard}>
       <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
@@ -663,29 +1100,49 @@ function ItemEditor({ item, onChange, onRemove }) {
           onChange={(e) => onChange({ name: e.target.value })}
           style={{ ...styles.input, flex: 1 }}
         />
+        <button
+          className="tap"
+          onClick={onToggleFav}
+          style={styles.iconBtn}
+          aria-label={favourited ? "Remove from favourites" : "Add to favourites"}
+          title={favourited ? "Remove from favourites" : "Add to favourites"}
+        >
+          <Star size={16} color={favourited ? COLORS.gold : COLORS.textMuted} fill={favourited ? COLORS.gold : "none"} />
+        </button>
         <button className="tap" onClick={onRemove} style={styles.iconBtn} aria-label="Remove item">
           <X size={15} color={COLORS.textMuted} />
         </button>
       </div>
       <div style={styles.formGrid}>
-        {[
-          ["cal", "kcal"],
-          ["p", "protein"],
-          ["c", "carbs"],
-          ["f", "fat"],
-        ].map(([field, ph]) => (
-          <input
-            key={field}
-            type="number"
-            inputMode="decimal"
-            placeholder={ph}
-            value={item[field]}
-            onChange={(e) => onChange({ [field]: e.target.value })}
-            style={styles.input}
-          />
+        {macros.map(([field, label]) => (
+          <label key={field} style={styles.fieldLabel}>
+            <span style={styles.miniLabel}>{label}</span>
+            <input
+              type="number"
+              inputMode="decimal"
+              placeholder="0"
+              value={item[field]}
+              onChange={(e) => onChange({ [field]: e.target.value })}
+              style={styles.input}
+            />
+          </label>
         ))}
       </div>
     </div>
+  );
+}
+
+function FavChip({ item, onAdd, onRemove }) {
+  return (
+    <span style={styles.favChip} title={`${fmt(item.cal)} cal · P${fmt(item.p)} C${fmt(item.c)} F${fmt(item.f)}`}>
+      <button className="tap" onClick={onAdd} style={styles.favChipMain}>
+        <Plus size={11} />
+        {item.name}
+      </button>
+      <button className="tap" onClick={onRemove} style={styles.favChipX} aria-label="Remove favourite">
+        <X size={11} color={COLORS.textMuted} />
+      </button>
+    </span>
   );
 }
 
@@ -702,8 +1159,253 @@ function KeyNotice({ onOpenSettings }) {
   );
 }
 
+// ---- Onboarding / BMR interview ----
+function OnboardingModal({ initialProfile, onApply, onClose }) {
+  const [answers, setAnswers] = useState({ ...EMPTY_PROFILE, ...initialProfile });
+  const [stage, setStage] = useState("intro"); // intro | question | results
+  const [qi, setQi] = useState(0);
+
+  const steps = useMemo(() => planSteps(answers), [answers.goal]);
+  const key = steps[qi];
+  const update = (patch) => setAnswers((a) => ({ ...a, ...patch }));
+  const plan = stage === "results" ? computePlan(answers) : null;
+
+  const next = () => (qi < steps.length - 1 ? setQi(qi + 1) : setStage("results"));
+  const back = () => (qi > 0 ? setQi(qi - 1) : setStage("intro"));
+
+  const weightUnit = answers.unit === "metric" ? "kg" : "lb";
+
+  return (
+    <Overlay onClose={onClose} title="Calorie setup">
+      {stage !== "intro" && (
+        <div style={styles.obProgress}>
+          <div
+            style={{
+              ...styles.obProgressBar,
+              width: `${stage === "results" ? 100 : ((qi + 1) / steps.length) * 100}%`,
+            }}
+          />
+        </div>
+      )}
+
+      {stage === "intro" && (
+        <div>
+          <div style={{ fontSize: 32, marginBottom: 6 }}>💪</div>
+          <div style={styles.obTitle}>Let's set your calorie & macro targets</div>
+          <p style={styles.obText}>
+            A few quick questions and I'll estimate your daily calories and macros from your BMR
+            (Mifflin-St Jeor) and activity level. You can fine-tune everything manually afterwards in
+            Settings.
+          </p>
+          <p style={styles.obDisclaimer}>
+            General guidance, not medical advice — check with your GP before changing your diet.
+          </p>
+          <div style={{ display: "flex", gap: 8, marginTop: 4 }}>
+            <button className="tap" onClick={onClose} style={{ ...styles.secondaryBtn, flex: 1 }}>
+              Skip
+            </button>
+            <button className="tap" onClick={() => setStage("question")} style={{ ...styles.primaryBtn, flex: 1 }}>
+              Start
+            </button>
+          </div>
+        </div>
+      )}
+
+      {stage === "question" && (
+        <div>
+          {key === "sex" && (
+            <Question title="Biological sex" hint="Needed for the metabolic equation.">
+              {["male", "female"].map((s) => (
+                <Choice key={s} active={answers.sex === s} onClick={() => update({ sex: s })} label={s === "male" ? "Male" : "Female"} />
+              ))}
+            </Question>
+          )}
+
+          {key === "age" && (
+            <Question title="How old are you?" hint="Age factors into your metabolic rate.">
+              <input
+                type="number"
+                inputMode="numeric"
+                placeholder="29"
+                value={answers.age}
+                onChange={(e) => update({ age: e.target.value })}
+                style={styles.input}
+                autoFocus
+              />
+            </Question>
+          )}
+
+          {key === "height" && (
+            <Question title="How tall are you?">
+              <div style={styles.segmented}>
+                <button
+                  onClick={() => update({ unit: "metric" })}
+                  style={{ ...styles.segment, ...(answers.unit === "metric" ? styles.segmentActive : {}) }}
+                >
+                  cm / kg
+                </button>
+                <button
+                  onClick={() => update({ unit: "imperial" })}
+                  style={{ ...styles.segment, ...(answers.unit === "imperial" ? styles.segmentActive : {}) }}
+                >
+                  ft·in / lb
+                </button>
+              </div>
+              {answers.unit === "metric" ? (
+                <input
+                  type="number"
+                  inputMode="decimal"
+                  placeholder="cm"
+                  value={answers.heightCm}
+                  onChange={(e) => update({ heightCm: e.target.value })}
+                  style={styles.input}
+                />
+              ) : (
+                <div style={{ display: "flex", gap: 8 }}>
+                  <input
+                    type="number"
+                    inputMode="decimal"
+                    placeholder="ft"
+                    value={answers.heightFt}
+                    onChange={(e) => update({ heightFt: e.target.value })}
+                    style={styles.input}
+                  />
+                  <input
+                    type="number"
+                    inputMode="decimal"
+                    placeholder="in"
+                    value={answers.heightIn}
+                    onChange={(e) => update({ heightIn: e.target.value })}
+                    style={styles.input}
+                  />
+                </div>
+              )}
+            </Question>
+          )}
+
+          {key === "weight" && (
+            <Question title="Current weight" hint={`In ${weightUnit}.`}>
+              <input
+                type="number"
+                inputMode="decimal"
+                placeholder={answers.unit === "metric" ? "70" : "155"}
+                value={answers.weight}
+                onChange={(e) => update({ weight: e.target.value })}
+                style={styles.input}
+                autoFocus
+              />
+            </Question>
+          )}
+
+          {key === "activity" && (
+            <Question title="How active are you day to day?">
+              {ACTIVITY.map((opt) => (
+                <Choice
+                  key={opt.key}
+                  active={answers.activity === opt.key}
+                  onClick={() => update({ activity: opt.key })}
+                  label={opt.label}
+                  helper={opt.helper}
+                />
+              ))}
+            </Question>
+          )}
+
+          {key === "goal" && (
+            <Question title="What's your goal?">
+              {GOALS.map((g) => (
+                <Choice key={g.key} active={answers.goal === g.key} onClick={() => update({ goal: g.key })} label={g.label} />
+              ))}
+            </Question>
+          )}
+
+          {key === "pace" && (
+            <Question title="How fast do you want results?">
+              {PACE.map((p) => (
+                <Choice key={p.key} active={answers.pace === p.key} onClick={() => update({ pace: p.key })} label={p.label} helper={p.helper} />
+              ))}
+            </Question>
+          )}
+
+          <div style={{ display: "flex", gap: 8, marginTop: 16 }}>
+            <button className="tap" onClick={back} style={styles.secondaryBtn}>
+              Back
+            </button>
+            <button
+              className="tap"
+              onClick={next}
+              disabled={!planIsValid(key, answers)}
+              style={{ ...styles.primaryBtn, flex: 1, opacity: planIsValid(key, answers) ? 1 : 0.5 }}
+            >
+              {qi === steps.length - 1 ? "See results" : "Next"}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {stage === "results" && plan && (
+        <div>
+          <div style={styles.obTitle}>Your suggested plan</div>
+          <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
+            <StatTile label="BMR" value={`${plan.bmr}`} />
+            <StatTile label="TDEE" value={`${plan.tdee}`} />
+          </div>
+          <div style={styles.targetTile}>
+            <div style={{ fontSize: 11, color: "#1A1400", opacity: 0.7 }}>DAILY CALORIE TARGET</div>
+            <div className="num" style={{ fontSize: 32, fontWeight: 700, color: "#1A1400" }}>{plan.dailyCalories}</div>
+          </div>
+          <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+            <StatTile label="Protein" value={`${plan.proteinG}g`} color={COLORS.gold} />
+            <StatTile label="Carbs" value={`${plan.carbsG}g`} color={COLORS.sage} />
+            <StatTile label="Fat" value={`${plan.fatG}g`} color={COLORS.clay} />
+          </div>
+          <div style={{ ...styles.hint, marginTop: 10 }}>
+            Water target {plan.waterL} L. You can adjust any of these manually in Settings.
+          </div>
+          <div style={{ display: "flex", gap: 8, marginTop: 16 }}>
+            <button className="tap" onClick={() => setStage("question")} style={styles.secondaryBtn}>
+              Back
+            </button>
+            <button className="tap" onClick={() => onApply(plan, answers)} style={{ ...styles.primaryBtn, flex: 1 }}>
+              <Check size={15} /> Apply these targets
+            </button>
+          </div>
+        </div>
+      )}
+    </Overlay>
+  );
+}
+
+function Question({ title, hint, children }) {
+  return (
+    <div>
+      <div style={styles.obTitle}>{title}</div>
+      {hint && <p style={styles.obHint}>{hint}</p>}
+      <div style={{ marginTop: 4 }}>{children}</div>
+    </div>
+  );
+}
+
+function Choice({ active, onClick, label, helper }) {
+  return (
+    <button className="tap" onClick={onClick} style={{ ...styles.choice, ...(active ? styles.choiceActive : {}) }}>
+      <div style={{ fontWeight: 600, color: active ? COLORS.gold : COLORS.text }}>{label}</div>
+      {helper && <div style={{ fontSize: 11.5, color: COLORS.textMuted, marginTop: 2 }}>{helper}</div>}
+    </button>
+  );
+}
+
+function StatTile({ label, value, color }) {
+  return (
+    <div style={styles.statTile}>
+      <div style={{ fontSize: 11, color: COLORS.textMuted, marginBottom: 2 }}>{label}</div>
+      <div className="num" style={{ fontSize: 18, fontWeight: 700, color: color || COLORS.text }}>{value}</div>
+    </div>
+  );
+}
+
 // ---- Settings modal ----
-function SettingsModal({ targets, apiKey, model, onClose, onSave }) {
+function SettingsModal({ targets, apiKey, model, onClose, onSave, onLaunchSetup }) {
   const [t, setT] = useState(targets);
   const [key, setKey] = useState(apiKey);
   const [mdl, setMdl] = useState(model || DEFAULT_MODEL);
@@ -713,6 +1415,10 @@ function SettingsModal({ targets, apiKey, model, onClose, onSave }) {
 
   return (
     <Overlay onClose={onClose} title="Settings">
+      <button className="tap" onClick={onLaunchSetup} style={{ ...styles.secondaryBtn, marginBottom: 16 }}>
+        <ClipboardList size={15} /> Calorie setup (BMR calculator)
+      </button>
+
       <div style={styles.cardLabel}>DAILY TARGETS (MAINTENANCE)</div>
       <div style={styles.settingsGrid}>
         <Labeled label="Calories">
@@ -732,6 +1438,23 @@ function SettingsModal({ targets, apiKey, model, onClose, onSave }) {
         </Labeled>
       </div>
 
+      <div style={{ ...styles.cardLabel, marginTop: 18 }}>AI MODEL</div>
+      <div style={styles.segmented}>
+        {MODEL_OPTIONS.map((m) => (
+          <button
+            key={m.id}
+            onClick={() => setMdl(m.id)}
+            style={{ ...styles.segment, ...(mdl === m.id ? styles.segmentActive : {}) }}
+          >
+            {m.label}
+          </button>
+        ))}
+      </div>
+      <div style={styles.hint}>
+        Opus is most capable, Haiku is fastest and cheapest, Sonnet is in between. Used for AI food
+        search and photo recognition.
+      </div>
+
       <div style={{ ...styles.cardLabel, marginTop: 18 }}>ANTHROPIC API KEY</div>
       <input
         type="password"
@@ -742,16 +1465,9 @@ function SettingsModal({ targets, apiKey, model, onClose, onSave }) {
         autoComplete="off"
       />
       <div style={styles.hint}>
-        Used only from this browser for AI food search and photo recognition. Stored locally, never
-        uploaded anywhere but Anthropic. Get a key at console.anthropic.com.
+        Used only from this browser. Stored locally, never uploaded anywhere but Anthropic. Get a key
+        at console.anthropic.com.
       </div>
-
-      <details style={{ marginTop: 12 }}>
-        <summary style={{ ...styles.cardLabel, cursor: "pointer" }}>ADVANCED</summary>
-        <Labeled label="Model">
-          <input value={mdl} onChange={(e) => setMdl(e.target.value)} style={styles.input} />
-        </Labeled>
-      </details>
 
       <button
         className="tap"
@@ -765,7 +1481,7 @@ function SettingsModal({ targets, apiKey, model, onClose, onSave }) {
               waterL: Number(t.waterL) || 0,
             },
             apiKey: key.trim(),
-            model: (mdl || DEFAULT_MODEL).trim(),
+            model: mdl || DEFAULT_MODEL,
           })
         }
         style={{ ...styles.primaryBtn, marginTop: 16 }}
@@ -808,6 +1524,7 @@ const COLORS = {
   text: "#F5EFE4",
   textMuted: "#A79C89",
   gold: "#E3A438",
+  green: "#6FB07F",
   sage: "#7C9473",
   clay: "#B97155",
   blue: "#5C8AA8",
@@ -836,11 +1553,16 @@ const styles = {
     padding: 16, marginBottom: 12,
   },
   cardLabel: { fontSize: 11, letterSpacing: 1.2, color: COLORS.textMuted, fontWeight: 600, marginBottom: 10 },
+  collapseHeader: {
+    display: "flex", justifyContent: "space-between", alignItems: "center", width: "100%",
+    background: "transparent", border: "none", padding: 0,
+  },
   wheelRow: { display: "flex", alignItems: "center", gap: 16 },
   macroList: { flex: 1 },
   rowBetween: { display: "flex", justifyContent: "space-between", alignItems: "center" },
-  mealTitle: { fontSize: 15, fontWeight: 700, display: "flex", alignItems: "baseline", gap: 8 },
-  mealCal: { fontSize: 12, color: COLORS.textMuted, fontWeight: 500 },
+  mealTitle: { fontSize: 15, fontWeight: 700, display: "flex", alignItems: "center", gap: 7 },
+  mealIcon: { display: "inline-flex", alignItems: "center" },
+  mealCal: { fontSize: 12, color: COLORS.textMuted, fontWeight: 500, marginLeft: 2 },
   addBtn: {
     display: "flex", alignItems: "center", gap: 4, background: "transparent",
     color: COLORS.gold, border: `1px solid ${COLORS.gold}`, borderRadius: 20,
@@ -859,10 +1581,30 @@ const styles = {
     border: `1px solid ${COLORS.border}`, borderRadius: 8, padding: "6px 10px",
     fontSize: 11.5, color: COLORS.text, whiteSpace: "nowrap", maxWidth: "100%",
   },
+  favChip: {
+    display: "inline-flex", alignItems: "stretch", background: COLORS.bg,
+    border: `1px solid ${COLORS.border}`, borderRadius: 8, overflow: "hidden", maxWidth: "100%",
+  },
+  favChipMain: {
+    display: "flex", alignItems: "center", gap: 4, background: "transparent", border: "none",
+    padding: "6px 8px 6px 10px", fontSize: 11.5, color: COLORS.text, whiteSpace: "nowrap",
+  },
+  favChipX: {
+    background: "transparent", border: "none", borderLeft: `1px solid ${COLORS.border}`,
+    padding: "0 7px", display: "flex", alignItems: "center",
+  },
+  foodRow: {
+    background: COLORS.bg, border: `1px solid ${COLORS.border}`, borderRadius: 10,
+    padding: 10, marginBottom: 8,
+  },
   weightRow: { display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 },
   bigNum: { fontSize: 32, fontWeight: 700 },
   unit: { fontSize: 15, color: COLORS.textMuted, fontWeight: 500 },
   weightInputRow: { display: "flex", gap: 6 },
+  linkBtn: {
+    background: "transparent", border: "none", color: COLORS.textMuted, fontSize: 12,
+    padding: "8px 0 0", textDecoration: "underline",
+  },
   input: {
     background: COLORS.bg, border: `1px solid ${COLORS.border}`, borderRadius: 8,
     padding: "9px 10px", color: COLORS.text, fontSize: 13, width: "100%", outline: "none",
@@ -901,13 +1643,15 @@ const styles = {
   segmentActive: { background: COLORS.card, color: COLORS.text, border: `1px solid ${COLORS.border}` },
   tabs: { display: "flex", gap: 6, marginBottom: 12 },
   tab: {
-    flex: 1, display: "flex", alignItems: "center", justifyContent: "center", gap: 5,
+    flex: 1, display: "flex", alignItems: "center", justifyContent: "center", gap: 4,
     background: COLORS.bg, border: `1px solid ${COLORS.border}`, color: COLORS.textMuted,
-    borderRadius: 9, padding: "9px 6px", fontSize: 12.5, fontWeight: 600,
+    borderRadius: 9, padding: "9px 4px", fontSize: 12, fontWeight: 600,
   },
   tabActive: { color: "#1A1400", background: COLORS.gold, border: `1px solid ${COLORS.gold}` },
   form: { display: "flex", flexDirection: "column", gap: 8, marginBottom: 4 },
-  formGrid: { display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 6, marginTop: 6 },
+  formGrid: { display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 6, marginTop: 8 },
+  fieldLabel: { display: "flex", flexDirection: "column", gap: 3 },
+  miniLabel: { fontSize: 10, color: COLORS.textMuted, letterSpacing: 0.3 },
   primaryBtn: {
     background: COLORS.gold, color: "#1A1400", border: "none", borderRadius: 9,
     padding: "11px", fontWeight: 700, fontSize: 13, width: "100%",
@@ -933,4 +1677,25 @@ const styles = {
   },
   settingsGrid: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 },
   hint: { fontSize: 11.5, color: COLORS.textMuted, marginTop: 6, lineHeight: 1.4 },
+
+  // Onboarding
+  obProgress: { height: 5, background: COLORS.bg, borderRadius: 3, overflow: "hidden", marginBottom: 16 },
+  obProgressBar: { height: "100%", background: COLORS.gold, borderRadius: 3, transition: "width 0.3s ease" },
+  obTitle: { fontFamily: "'Space Grotesk', sans-serif", fontSize: 18, fontWeight: 700, marginBottom: 4 },
+  obText: { fontSize: 13, color: COLORS.textMuted, lineHeight: 1.5, marginBottom: 10 },
+  obHint: { fontSize: 12, color: COLORS.textMuted, marginBottom: 8 },
+  obDisclaimer: {
+    fontSize: 11.5, color: COLORS.textMuted, background: COLORS.bg, border: `1px solid ${COLORS.border}`,
+    borderRadius: 10, padding: 10, lineHeight: 1.4, marginBottom: 12,
+  },
+  choice: {
+    display: "block", width: "100%", textAlign: "left", background: COLORS.bg,
+    border: `1px solid ${COLORS.border}`, borderRadius: 12, padding: "12px 14px", marginBottom: 8,
+  },
+  choiceActive: { border: `1px solid ${COLORS.gold}`, background: "rgba(227,164,56,0.12)" },
+  statTile: {
+    flex: 1, background: COLORS.bg, border: `1px solid ${COLORS.border}`, borderRadius: 12,
+    padding: "10px 12px",
+  },
+  targetTile: { background: COLORS.gold, borderRadius: 14, padding: "12px 16px" },
 };
